@@ -2,3 +2,5 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.pyc
+outputs/
+project_config.json

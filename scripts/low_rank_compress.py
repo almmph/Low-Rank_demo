@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
-"""Compress a local Hugging Face causal LM by replacing selected Linear layers with low-rank factors.
-
-Example:
-    python3 scripts/low_rank_compress.py \
-        --model-path /models/Qwen2.5-7B-Instruct \
-        --output-dir /models/Qwen2.5-7B-Instruct-lowrank \
-        --rank-ratio 0.25 \
-        --modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
-"""
+"""Compress a local Hugging Face causal LM with fixed-rank or perplexity-guided low-rank search."""
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import torch
 import torch.nn as nn
@@ -38,7 +31,9 @@ DEFAULT_TARGET_SUFFIXES = (
     "up_proj",
     "down_proj",
 )
+DEFAULT_SEARCH_RANK_RATIOS = (0.125, 0.25, 0.375, 0.5)
 MANIFEST_FILENAME = "low_rank_manifest.json"
+SEARCH_REPORT_FILENAME = "search_report.json"
 DTYPE_MAP = {
     "auto": None,
     "float16": torch.float16,
@@ -76,6 +71,51 @@ class CompressionSummary:
         if self.target_params_after == 0:
             return 0.0
         return self.target_params_before / self.target_params_after
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["total_compression_ratio"] = self.total_compression_ratio
+        data["target_compression_ratio"] = self.target_compression_ratio
+        return data
+
+
+@dataclass(frozen = True)
+class SearchCandidate:
+    rank: int | None = None
+    rank_ratio: float | None = None
+
+    def __post_init__(self) -> None:
+        has_rank = self.rank is not None
+        has_ratio = self.rank_ratio is not None
+        if has_rank == has_ratio:
+            raise ValueError("Exactly one of rank or rank_ratio must be set for SearchCandidate.")
+
+    @property
+    def label(self) -> str:
+        if self.rank is not None:
+            return f"rank={self.rank}"
+        return f"rank_ratio={self.rank_ratio:.4f}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rank": self.rank,
+            "rank_ratio": self.rank_ratio,
+            "label": self.label,
+        }
+
+
+@dataclass
+class SearchResult:
+    candidate: SearchCandidate
+    perplexity: float
+    summary: CompressionSummary
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate": self.candidate.to_dict(),
+            "perplexity": self.perplexity,
+            "summary": self.summary.to_dict(),
+        }
 
 
 class LowRankLinear(nn.Module):
@@ -189,6 +229,90 @@ class LowRankLinear(nn.Module):
         if linear.bias is not None:
             module.output_factor.bias.copy_(linear.bias.detach())
         return module
+
+
+def build_default_project_config() -> dict[str, Any]:
+    return {
+        "model_path": "",
+        "output_dir": "",
+        "modules": list(DEFAULT_TARGET_SUFFIXES),
+        "exclude_modules": [],
+        "rank": None,
+        "rank_ratio": 0.25,
+        "min_rank": 64,
+        "max_rank": None,
+        "dtype": "auto",
+        "device": None,
+        "svd_method": "auto",
+        "svd_niter": 2,
+        "max_shard_size": "100GB",
+        "trust_remote_code": False,
+        "safe_serialization": True,
+        "quiet": False,
+        "search_by_perplexity": False,
+        "search_ranks": [],
+        "search_rank_ratios": list(DEFAULT_SEARCH_RANK_RATIOS),
+        "eval_file": "",
+        "eval_text_key": "text",
+        "eval_max_samples": 128,
+        "eval_max_length": 512,
+        "eval_batch_size": 4,
+        "max_perplexity_ratio": 1.05,
+        "search_report_name": SEARCH_REPORT_FILENAME,
+    }
+
+
+def normalize_job_config(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = build_default_project_config()
+    normalized.update(config)
+    normalized["modules"] = list(normalized.get("modules") or DEFAULT_TARGET_SUFFIXES)
+    normalized["exclude_modules"] = list(normalized.get("exclude_modules") or [])
+    normalized["search_ranks"] = list(normalized.get("search_ranks") or [])
+    normalized["search_rank_ratios"] = list(
+        normalized.get("search_rank_ratios") or DEFAULT_SEARCH_RANK_RATIOS
+    )
+    normalized["quiet"] = bool(normalized.get("quiet", False))
+    normalized["search_by_perplexity"] = bool(
+        normalized.get("search_by_perplexity", False)
+    )
+    normalized["trust_remote_code"] = bool(normalized.get("trust_remote_code", False))
+    normalized["safe_serialization"] = bool(normalized.get("safe_serialization", True))
+    normalized["dtype"] = normalized.get("dtype") or "auto"
+    normalized["svd_method"] = normalized.get("svd_method") or "auto"
+    normalized["eval_text_key"] = normalized.get("eval_text_key") or "text"
+    normalized["search_report_name"] = (
+        normalized.get("search_report_name") or SEARCH_REPORT_FILENAME
+    )
+    return normalized
+
+
+def validate_job_config(config: dict[str, Any]) -> None:
+    if not config.get("model_path"):
+        raise ValueError("model_path is required.")
+    if not config.get("output_dir"):
+        raise ValueError("output_dir is required.")
+    if config["dtype"] not in DTYPE_MAP:
+        raise ValueError(f"Unsupported dtype={config['dtype']}.")
+    if config["svd_method"] not in {"auto", "exact", "randomized"}:
+        raise ValueError(f"Unsupported svd_method={config['svd_method']}.")
+    if config["min_rank"] is not None and int(config["min_rank"]) <= 0:
+        raise ValueError("min_rank must be positive.")
+    if config["max_rank"] is not None and int(config["max_rank"]) <= 0:
+        raise ValueError("max_rank must be positive when set.")
+    if config["max_perplexity_ratio"] <= 0:
+        raise ValueError("max_perplexity_ratio must be positive.")
+
+    if config["search_by_perplexity"]:
+        if not config.get("eval_file"):
+            raise ValueError("eval_file is required when search_by_perplexity is enabled.")
+        if config["eval_batch_size"] <= 0:
+            raise ValueError("eval_batch_size must be positive.")
+        if config["eval_max_length"] <= 1:
+            raise ValueError("eval_max_length must be greater than 1.")
+    elif config["rank"] is None and config["rank_ratio"] is None:
+        raise ValueError(
+            "Either rank or rank_ratio must be provided when perplexity search is disabled."
+        )
 
 
 def _should_use_randomized_svd(
@@ -469,6 +593,277 @@ def _load_saved_state_dict(model_dir: Path) -> dict[str, torch.Tensor]:
     raise FileNotFoundError(f"No model weights found under {model_dir}")
 
 
+def load_base_model(
+    model_path: str | Path,
+    *,
+    dtype_name: str,
+    device: str | torch.device | None,
+    trust_remote_code: bool,
+) -> nn.Module:
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype = DTYPE_MAP[dtype_name],
+        low_cpu_mem_usage = True,
+        trust_remote_code = trust_remote_code,
+        local_files_only = True,
+    )
+    if device is not None:
+        model = model.to(device)
+    model.eval()
+    return model
+
+
+def load_optional_tokenizer(
+    model_path: str | Path,
+    *,
+    trust_remote_code: bool,
+    quiet: bool,
+    required: bool,
+):
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code = trust_remote_code,
+            local_files_only = True,
+        )
+    except Exception as exc:
+        if required:
+            raise RuntimeError(
+                "A local tokenizer is required for perplexity evaluation but could not be loaded."
+            ) from exc
+        if not quiet:
+            print(f"[warn] tokenizer was not saved because it could not be loaded: {exc}")
+        return None
+
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.unk_token is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+    return tokenizer
+
+
+def _append_eval_text(texts: list[str], value: Any, *, text_key: str) -> None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            texts.append(stripped)
+        return
+
+    if isinstance(value, dict):
+        if text_key in value:
+            _append_eval_text(texts, value[text_key], text_key = text_key)
+            return
+        for fallback_key in ("text", "content", "prompt"):
+            if fallback_key in value:
+                _append_eval_text(texts, value[fallback_key], text_key = text_key)
+                return
+        return
+
+    if isinstance(value, list):
+        for item in value:
+            _append_eval_text(texts, item, text_key = text_key)
+
+
+def load_eval_texts(
+    eval_file: str | Path,
+    *,
+    text_key: str,
+    max_samples: int | None,
+) -> list[str]:
+    path = Path(eval_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Evaluation file does not exist: {path}")
+
+    texts: list[str] = []
+    suffix = path.suffix.lower()
+
+    if suffix == ".jsonl":
+        with path.open("r", encoding = "utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                _append_eval_text(texts, json.loads(stripped), text_key = text_key)
+                if max_samples is not None and len(texts) >= max_samples:
+                    break
+    elif suffix == ".json":
+        with path.open("r", encoding = "utf-8") as handle:
+            payload = json.load(handle)
+
+        if isinstance(payload, dict):
+            if "texts" in payload:
+                _append_eval_text(texts, payload["texts"], text_key = text_key)
+            elif text_key in payload:
+                _append_eval_text(texts, payload[text_key], text_key = text_key)
+            else:
+                _append_eval_text(texts, payload, text_key = text_key)
+        else:
+            _append_eval_text(texts, payload, text_key = text_key)
+    else:
+        with path.open("r", encoding = "utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if stripped:
+                    texts.append(stripped)
+                if max_samples is not None and len(texts) >= max_samples:
+                    break
+
+    if max_samples is not None:
+        texts = texts[:max_samples]
+    if not texts:
+        raise ValueError(f"No evaluation texts were loaded from {path}")
+    return texts
+
+
+def _batch_items(items: Sequence[str], batch_size: int) -> Iterable[list[str]]:
+    for start in range(0, len(items), batch_size):
+        yield list(items[start : start + batch_size])
+
+
+@torch.inference_mode()
+def compute_perplexity(
+    model: nn.Module,
+    tokenizer,
+    texts: Sequence[str],
+    *,
+    max_length: int,
+    batch_size: int,
+) -> float:
+    if not texts:
+        raise ValueError("texts must be non-empty for perplexity evaluation.")
+    if tokenizer.pad_token_id is None:
+        raise ValueError(
+            "Tokenizer needs a pad token for perplexity evaluation. "
+            "Set one before calling compute_perplexity."
+        )
+
+    device = next(model.parameters()).device
+    total_nll = 0.0
+    total_tokens = 0
+    previous_use_cache = getattr(model.config, "use_cache", None)
+    if previous_use_cache is not None:
+        model.config.use_cache = False
+
+    try:
+        for batch in _batch_items(list(texts), batch_size):
+            encoded = tokenizer(
+                batch,
+                return_tensors = "pt",
+                padding = True,
+                truncation = True,
+                max_length = max_length,
+            )
+            input_ids = encoded["input_ids"].to(device)
+            attention_mask = encoded.get("attention_mask")
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+            attention_mask = attention_mask.to(device)
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100
+
+            outputs = model(
+                input_ids = input_ids,
+                attention_mask = attention_mask,
+                labels = labels,
+            )
+            token_count = int((labels[:, 1:] != -100).sum().item())
+            if token_count == 0:
+                continue
+
+            total_nll += float(outputs.loss.detach().cpu()) * token_count
+            total_tokens += token_count
+    finally:
+        if previous_use_cache is not None:
+            model.config.use_cache = previous_use_cache
+
+    if total_tokens == 0:
+        raise ValueError("Perplexity evaluation saw zero valid tokens.")
+    return math.exp(total_nll / total_tokens)
+
+
+def build_search_candidates(
+    search_ranks: Sequence[int],
+    search_rank_ratios: Sequence[float],
+) -> list[SearchCandidate]:
+    candidates: list[SearchCandidate] = []
+    seen: set[tuple[str, float]] = set()
+
+    for rank in search_ranks:
+        if rank <= 0:
+            raise ValueError(f"search rank must be positive, got {rank}")
+        key = ("rank", float(rank))
+        if key not in seen:
+            seen.add(key)
+            candidates.append(SearchCandidate(rank = int(rank)))
+
+    for rank_ratio in search_rank_ratios:
+        if rank_ratio <= 0:
+            raise ValueError(f"search rank ratio must be positive, got {rank_ratio}")
+        key = ("rank_ratio", float(rank_ratio))
+        if key not in seen:
+            seen.add(key)
+            candidates.append(SearchCandidate(rank_ratio = float(rank_ratio)))
+
+    if not candidates:
+        for default_ratio in DEFAULT_SEARCH_RANK_RATIOS:
+            candidates.append(SearchCandidate(rank_ratio = default_ratio))
+    return candidates
+
+
+def select_best_search_result(
+    results: Sequence[SearchResult],
+    *,
+    baseline_perplexity: float,
+    max_perplexity_ratio: float,
+) -> SearchResult:
+    if not results:
+        raise ValueError("No search results were provided.")
+
+    threshold = baseline_perplexity * max_perplexity_ratio
+    eligible = [result for result in results if result.perplexity <= threshold]
+    if eligible:
+        return min(
+            eligible,
+            key = lambda result: (
+                result.summary.total_params_after,
+                result.perplexity,
+                result.summary.target_params_after,
+            ),
+        )
+
+    return min(
+        results,
+        key = lambda result: (
+            result.perplexity,
+            result.summary.total_params_after,
+            result.summary.target_params_after,
+        ),
+    )
+
+
+def write_search_report(
+    output_dir: str | Path,
+    *,
+    baseline_perplexity: float,
+    max_perplexity_ratio: float,
+    selected_result: SearchResult,
+    results: Sequence[SearchResult],
+    report_name: str,
+) -> Path:
+    output_dir = Path(output_dir)
+    report = {
+        "baseline_perplexity": baseline_perplexity,
+        "max_perplexity_ratio": max_perplexity_ratio,
+        "selected_result": selected_result.to_dict(),
+        "results": [result.to_dict() for result in results],
+    }
+    report_path = output_dir / report_name
+    with report_path.open("w", encoding = "utf-8") as handle:
+        json.dump(report, handle, ensure_ascii = False, indent = 2)
+    return report_path
+
+
 def format_count(value: int) -> str:
     if value >= 1_000_000_000:
         return f"{value / 1_000_000_000:.2f}B"
@@ -477,6 +872,220 @@ def format_count(value: int) -> str:
     if value >= 1_000:
         return f"{value / 1_000:.2f}K"
     return str(value)
+
+
+def release_model(model: nn.Module | None) -> None:
+    if model is None:
+        return
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def run_perplexity_search(config: dict[str, Any]) -> tuple[float, SearchResult, list[SearchResult]]:
+    tokenizer = load_optional_tokenizer(
+        config["model_path"],
+        trust_remote_code = config["trust_remote_code"],
+        quiet = config["quiet"],
+        required = True,
+    )
+    eval_texts = load_eval_texts(
+        config["eval_file"],
+        text_key = config["eval_text_key"],
+        max_samples = config["eval_max_samples"],
+    )
+
+    if not config["quiet"]:
+        print(
+            f"[search] loaded {len(eval_texts)} evaluation samples from {config['eval_file']}"
+        )
+
+    baseline_model = load_base_model(
+        config["model_path"],
+        dtype_name = config["dtype"],
+        device = config["device"],
+        trust_remote_code = config["trust_remote_code"],
+    )
+    baseline_perplexity = compute_perplexity(
+        baseline_model,
+        tokenizer,
+        eval_texts,
+        max_length = config["eval_max_length"],
+        batch_size = config["eval_batch_size"],
+    )
+    release_model(baseline_model)
+
+    if not config["quiet"]:
+        print(f"[search] baseline perplexity: {baseline_perplexity:.4f}")
+
+    candidates = build_search_candidates(
+        config["search_ranks"],
+        config["search_rank_ratios"],
+    )
+    results: list[SearchResult] = []
+    for candidate in candidates:
+        model = load_base_model(
+            config["model_path"],
+            dtype_name = config["dtype"],
+            device = config["device"],
+            trust_remote_code = config["trust_remote_code"],
+        )
+        _, summary = compress_model(
+            model,
+            modules = config["modules"],
+            exclude_modules = config["exclude_modules"],
+            rank = candidate.rank,
+            rank_ratio = candidate.rank_ratio,
+            min_rank = config["min_rank"],
+            max_rank = config["max_rank"],
+            svd_method = config["svd_method"],
+            svd_niter = config["svd_niter"],
+            verbose = False,
+        )
+        if summary.replaced_modules == 0:
+            release_model(model)
+            if not config["quiet"]:
+                print(f"[search] skipped {candidate.label}: no layers were compressible")
+            continue
+
+        perplexity = compute_perplexity(
+            model,
+            tokenizer,
+            eval_texts,
+            max_length = config["eval_max_length"],
+            batch_size = config["eval_batch_size"],
+        )
+        release_model(model)
+        result = SearchResult(
+            candidate = candidate,
+            perplexity = perplexity,
+            summary = summary,
+        )
+        results.append(result)
+        if not config["quiet"]:
+            print(
+                f"[search] {candidate.label}: perplexity={perplexity:.4f}, "
+                f"total_compression={summary.total_compression_ratio:.2f}x"
+            )
+
+    if not results:
+        raise RuntimeError("No valid search candidates produced a compressed model.")
+
+    selected_result = select_best_search_result(
+        results,
+        baseline_perplexity = baseline_perplexity,
+        max_perplexity_ratio = config["max_perplexity_ratio"],
+    )
+    if not config["quiet"]:
+        threshold = baseline_perplexity * config["max_perplexity_ratio"]
+        print(
+            f"[search] selected {selected_result.candidate.label} "
+            f"(ppl={selected_result.perplexity:.4f}, threshold={threshold:.4f})"
+        )
+    return baseline_perplexity, selected_result, results
+
+
+def run_job(config: dict[str, Any]) -> dict[str, Any]:
+    config = normalize_job_config(config)
+    validate_job_config(config)
+
+    baseline_perplexity = None
+    selected_result = None
+    search_results: list[SearchResult] = []
+    chosen_rank = config["rank"]
+    chosen_rank_ratio = config["rank_ratio"]
+
+    if config["search_by_perplexity"]:
+        baseline_perplexity, selected_result, search_results = run_perplexity_search(config)
+        chosen_rank = selected_result.candidate.rank
+        chosen_rank_ratio = selected_result.candidate.rank_ratio
+
+    model = load_base_model(
+        config["model_path"],
+        dtype_name = config["dtype"],
+        device = config["device"],
+        trust_remote_code = config["trust_remote_code"],
+    )
+    tokenizer = load_optional_tokenizer(
+        config["model_path"],
+        trust_remote_code = config["trust_remote_code"],
+        quiet = config["quiet"],
+        required = False,
+    )
+
+    manifest, summary = compress_model(
+        model,
+        modules = config["modules"],
+        exclude_modules = config["exclude_modules"],
+        rank = chosen_rank,
+        rank_ratio = chosen_rank_ratio,
+        min_rank = config["min_rank"],
+        max_rank = config["max_rank"],
+        svd_method = config["svd_method"],
+        svd_niter = config["svd_niter"],
+        verbose = not config["quiet"],
+    )
+    if summary.replaced_modules == 0:
+        raise RuntimeError("No layers were compressed. Relax rank settings or update modules.")
+
+    if selected_result is not None:
+        manifest["search"] = {
+            "baseline_perplexity": baseline_perplexity,
+            "selected_result": selected_result.to_dict(),
+            "max_perplexity_ratio": config["max_perplexity_ratio"],
+        }
+
+    save_compressed_model(
+        model,
+        config["output_dir"],
+        manifest,
+        tokenizer = tokenizer,
+        safe_serialization = config["safe_serialization"],
+        max_shard_size = config["max_shard_size"],
+    )
+    release_model(model)
+
+    search_report_path = None
+    if selected_result is not None:
+        search_report_path = write_search_report(
+            config["output_dir"],
+            baseline_perplexity = baseline_perplexity,
+            max_perplexity_ratio = config["max_perplexity_ratio"],
+            selected_result = selected_result,
+            results = search_results,
+            report_name = config["search_report_name"],
+        )
+
+    print("")
+    print(f"Saved compressed model to: {config['output_dir']}")
+    print(f"Replaced modules: {summary.replaced_modules}")
+    print(f"Skipped modules: {summary.skipped_modules}")
+    if selected_result is not None:
+        print(f"Selected candidate: {selected_result.candidate.label}")
+        print(f"Baseline perplexity: {baseline_perplexity:.4f}")
+        print(f"Compressed perplexity: {selected_result.perplexity:.4f}")
+    print(
+        f"Target params: {format_count(summary.target_params_before)} -> "
+        f"{format_count(summary.target_params_after)} "
+        f"({summary.target_compression_ratio:.2f}x)"
+    )
+    print(
+        f"Total params: {format_count(summary.total_params_before)} -> "
+        f"{format_count(summary.total_params_after)} "
+        f"({summary.total_compression_ratio:.2f}x)"
+    )
+    if search_report_path is not None:
+        print(f"Search report: {search_report_path}")
+    print("Reload later in Python with: from low_rank_compress import load_low_rank_model")
+
+    return {
+        "output_dir": str(config["output_dir"]),
+        "summary": summary.to_dict(),
+        "manifest_path": str(Path(config["output_dir"]) / MANIFEST_FILENAME),
+        "search_report_path": str(search_report_path) if search_report_path else None,
+        "selected_candidate": selected_result.to_dict() if selected_result else None,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -544,6 +1153,64 @@ def parse_args() -> argparse.Namespace:
         help = "Save weights as safetensors when enabled.",
     )
     parser.add_argument(
+        "--search-by-perplexity",
+        action = "store_true",
+        help = "Search candidate ranks and select the best one by validation perplexity.",
+    )
+    parser.add_argument(
+        "--search-ranks",
+        nargs = "*",
+        type = int,
+        default = None,
+        help = "Candidate fixed ranks to try during perplexity search.",
+    )
+    parser.add_argument(
+        "--search-rank-ratios",
+        nargs = "*",
+        type = float,
+        default = None,
+        help = "Candidate rank ratios to try during perplexity search.",
+    )
+    parser.add_argument(
+        "--eval-file",
+        default = "",
+        help = "Validation text file used for perplexity search. Supports txt, json, jsonl.",
+    )
+    parser.add_argument(
+        "--eval-text-key",
+        default = "text",
+        help = "Text key to read when --eval-file is json/jsonl.",
+    )
+    parser.add_argument(
+        "--eval-max-samples",
+        type = int,
+        default = 128,
+        help = "Maximum number of evaluation samples to load.",
+    )
+    parser.add_argument(
+        "--eval-max-length",
+        type = int,
+        default = 512,
+        help = "Maximum sequence length used during perplexity evaluation.",
+    )
+    parser.add_argument(
+        "--eval-batch-size",
+        type = int,
+        default = 4,
+        help = "Batch size used during perplexity evaluation.",
+    )
+    parser.add_argument(
+        "--max-perplexity-ratio",
+        type = float,
+        default = 1.05,
+        help = "Pick the strongest compression whose perplexity stays under baseline * ratio.",
+    )
+    parser.add_argument(
+        "--search-report-name",
+        default = SEARCH_REPORT_FILENAME,
+        help = "Filename for the saved search report inside output-dir.",
+    )
+    parser.add_argument(
         "--quiet",
         action = "store_true",
         help = "Suppress per-layer progress logs.",
@@ -552,73 +1219,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
-    if args.rank is None and args.rank_ratio is None:
-        raise SystemExit("Either --rank or --rank-ratio must be provided.")
-
-    torch_dtype = DTYPE_MAP[args.dtype]
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype = torch_dtype,
-        low_cpu_mem_usage = True,
-        trust_remote_code = args.trust_remote_code,
-        local_files_only = True,
-    )
-    if args.device is not None:
-        model = model.to(args.device)
-    tokenizer = None
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.model_path,
-            trust_remote_code = args.trust_remote_code,
-            local_files_only = True,
-        )
-    except Exception as exc:
-        if not args.quiet:
-            print(f"[warn] tokenizer was not saved because it could not be loaded: {exc}")
-
-    manifest, summary = compress_model(
-        model,
-        modules = args.modules,
-        exclude_modules = args.exclude_modules,
-        rank = args.rank,
-        rank_ratio = args.rank_ratio,
-        min_rank = args.min_rank,
-        max_rank = args.max_rank,
-        svd_method = args.svd_method,
-        svd_niter = args.svd_niter,
-        verbose = not args.quiet,
-    )
-    if summary.replaced_modules == 0:
-        raise SystemExit("No layers were compressed. Relax rank settings or update --modules.")
-
-    save_compressed_model(
-        model,
-        args.output_dir,
-        manifest,
-        tokenizer = tokenizer,
-        safe_serialization = args.safe_serialization,
-        max_shard_size = args.max_shard_size,
-    )
-
-    print("")
-    print(f"Saved compressed model to: {args.output_dir}")
-    print(f"Replaced modules: {summary.replaced_modules}")
-    print(f"Skipped modules: {summary.skipped_modules}")
-    print(
-        f"Target params: {format_count(summary.target_params_before)} -> "
-        f"{format_count(summary.target_params_after)} "
-        f"({summary.target_compression_ratio:.2f}x)"
-    )
-    print(
-        f"Total params: {format_count(summary.total_params_before)} -> "
-        f"{format_count(summary.total_params_after)} "
-        f"({summary.total_compression_ratio:.2f}x)"
-    )
-    print(
-        "Reload later in Python with: "
-        "from low_rank_compress import load_low_rank_model"
-    )
+    run_job(vars(parse_args()))
     return 0
 
 
